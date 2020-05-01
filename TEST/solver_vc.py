@@ -1,0 +1,190 @@
+import torch
+import numpy as np
+import sys
+import os 
+import torch.nn as nn
+import torch.nn.functional as F
+import yaml
+import pickle
+import glob
+import re
+
+from model import AE, AE_D
+from model_vc import AutoVC
+from resemblyzer import VoiceEncoder
+from dataset import TotalDataset
+from torch.utils.data import DataLoader
+from utils import *
+from functools import reduce
+from collections import defaultdict
+
+import matplotlib as mpl
+mpl.use('Agg')
+from matplotlib import pyplot as plt
+import librosa.display as lds
+
+class Solver_vc(object):
+    def __init__(self, config, args):
+        # config store the value of hyperparameters, turn to attr by AttrDict
+        self.config = config
+        #print(config)
+
+        # args store other information
+        self.args = args
+        #print(self.args)
+
+        # logger to use tensorboard
+        self.logger = Logger(self.args.logdir)
+
+        # get dataloader
+        self.get_data_loaders()
+
+        # init the model with config
+        self.build_model()
+        self.save_config()
+
+        if args.load_model:
+            self.load_model()
+
+    def save_model(self, iteration):
+        # save model and their optimizer
+        torch.save(self.model.state_dict(), f'{self.args.store_model_path}model-{iteration+1}.ckpt')
+        torch.save(self.opt.state_dict(), f'{self.args.store_model_path}model-{iteration+1}.opt')
+
+    def save_config(self):
+        with open(f'{self.args.store_model_path}.config.yaml', 'w') as f:
+            yaml.dump(self.config, f)
+        with open(f'{self.args.store_model_path}.args.yaml', 'w') as f:
+            yaml.dump(vars(self.args), f)
+        return
+
+    def load_model(self):
+        print(f'Load model from {self.args.load_model_path}')
+        self.model.load_state_dict(torch.load(f'{self.args.load_model_path}.ckpt'))
+        self.opt.load_state_dict(torch.load(f'{self.args.load_model_path}.opt'))
+        return
+
+
+    def get_data_loaders(self):
+        data_dir = self.args.data_dir
+        
+        self.train_dataset = TotalDataset(
+                os.path.join(data_dir, 'dataset.hdf5'), 
+                os.path.join(data_dir, 'train_data.json'), 
+                segment_size=self.config['data_loader']['segment_size'],
+                load_mel=self.config['data_loader']['load_mel'])
+
+        self.train_loader = DataLoader(
+                dataset=self.train_dataset, 
+                collate_fn=self.train_dataset.collate_fn,
+                batch_size=self.config['data_loader']['batch_size'], 
+                shuffle=self.config['data_loader']['shuffle'], 
+                num_workers=self.config['data_loader']['num_workers'], 
+                pin_memory=True)
+
+        self.train_iter = infinite_iter(self.train_loader)
+
+        return
+
+    def build_model(self): 
+        # create model, discriminator, optimizers
+        # self.model = cc(AE(self.config))
+        speaker_encoder = VoiceEncoder()
+        # self.model = cc(AE_D(self.config, speaker_encoder))
+        self.model = cc(AutoVC(32,256,512,32,speaker_encoder))
+        #print(self.model)
+        optimizer = self.config['optimizer']
+        self.opt = torch.optim.Adam(
+                self.model.parameters(), 
+                lr=optimizer['lr'], 
+                betas=(optimizer['beta1'], optimizer['beta2']), 
+                amsgrad=optimizer['amsgrad'], 
+                weight_decay=optimizer['weight_decay'])
+        #print(self.opt)
+        return
+
+    def inference_one_utterance(self, x, xs_d, xt_d, xs_len, xd_len):
+        spec = self.model.inference(
+            x.unsqueeze(0).permute(0,2,1),
+            xs_d.unsqueeze(0),
+            xt_d.unsqueeze(0),
+            [xs_len],
+            [xd_len])
+
+
+        spec = spec[0, 0, :, :].detach().cpu().numpy()
+
+        return spec
+
+    def ae_step(self, data, data_d, data_d_len):
+        X1 = cc(data).permute(0,2,1)
+        X1_d = cc(data_d)
+        X1_d_len = data_d_len
+        X1rt, X1r, C1 = self.model(X1, X1_d, X1_d, X1_d_len)
+        C1r = self.model(X1r[:, 0, :, :].permute(0,2,1), X1_d, None, X1_d_len)
+
+        criterion_recon = nn.L1Loss()
+        criterion_recon0 = nn.L1Loss()
+        criterion_content = nn.L1Loss()
+
+        L_recon0 = criterion_recon0(X1rt[:, 0, :, :].permute(0,2,1), X1)
+        L_recon = criterion_recon(X1r[:, 0, :, :].permute(0,2,1), X1)
+        L_content = criterion_content(C1r, C1)
+        
+        loss = L_recon + 1.0 * L_recon0 + 1.0 * L_content
+
+        self.opt.zero_grad()
+        loss.backward()
+        # grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config['optimizer']['grad_norm'])
+        self.opt.step()
+        meta = {'loss_rec': L_recon.item(),
+                'loss_content': L_content.item()}
+        '''
+        def plot_spectrograms(data, pic_path):
+            data = data.T
+            lds.specshow(data, y_axis='mel', x_axis='time', cmap=plt.cm.Blues)
+            plt.title('Mel spectrogram')
+            plt.xlabel('Time', fontsize=20)
+            plt.ylabel('Frequency', fontsize=20)
+            plt.savefig(pic_path)
+            plt.clf()
+            plt.cla()
+            plt.close()
+            return
+
+        dataset = self.train_dataset.dataset
+        for i in range(len(data)):
+            source_spec = cc(data[i])
+            source_dspec = cc(data_d[i])
+            source_spec_rec = self.inference_one_utterance(source_spec, source_dspec, source_dspec, data_d_len[i], data_d_len[i])
+            plot_spectrograms(source_spec.cpu().numpy(), 'src_sync.png')
+            plot_spectrograms(source_spec_rec, 'src_rec_one.png')
+            plot_spectrograms(X1r[i, 0, :, :].detach().cpu().numpy(), 'src_rec_batch.png')
+            criterion = nn.L1Loss()
+            loss_src_rec = criterion(torch.from_numpy(source_spec_rec), source_spec.cpu())
+            loss_src_rec2 = criterion(X1r[i, 0, :, :].detach().cpu(), source_spec.cpu())
+            print('Source Rec Loss: {} | {}'.format(loss_src_rec, loss_src_rec2))
+            input()
+        '''
+
+
+        return meta
+
+    def train(self, n_iterations):
+        for iteration in range(n_iterations): 
+            data = next(self.train_iter)
+            meta = self.ae_step(data['mel'], data['dmel'], data['dmel_len'])
+            # add to logger
+            if iteration % self.args.summary_steps == 0:
+                self.logger.scalars_summary(f'{self.args.tag}/vc_train', meta, iteration)
+
+            loss_rec = meta['loss_rec']
+            loss_content = meta['loss_content']
+
+            print(f'AE:[{iteration + 1}/{n_iterations}], loss_rec={loss_rec:.4f}, '
+                    f'loss_content={loss_content:.4f}     ', end='\r')
+            if (iteration + 1) % self.args.save_steps == 0 or iteration + 1 == n_iterations:
+                self.save_model(iteration=iteration)
+                print()
+        return
+
